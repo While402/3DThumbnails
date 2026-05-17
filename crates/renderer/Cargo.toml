@@ -1,0 +1,15 @@
+[package]
+name = "renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+bytemuck = "1"
+glam = "0.29"
+gltf = { version = "1.4", features = ["import", "KHR_texture_transform"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "2"
+tobj = "4"
+ufbx = "0.10"

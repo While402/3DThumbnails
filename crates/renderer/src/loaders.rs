@@ -1,0 +1,518 @@
+use std::{path::Path, sync::Arc};
+
+use anyhow::{anyhow, bail, Context};
+use glam::{Mat4, Vec2, Vec3};
+use gltf::{image::Format, texture::WrappingMode};
+
+use crate::{RenderError, Scene, Texture, Triangle, Vertex, WrapMode};
+
+pub(crate) fn load_scene(path: &Path) -> Result<Scene, RenderError> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "obj" => load_obj(path).map_err(RenderError::Load),
+        "glb" | "gltf" => load_gltf(path).map_err(RenderError::Load),
+        "fbx" => load_fbx(path).map_err(RenderError::Load),
+        _ => Err(RenderError::UnsupportedFormat),
+    }
+}
+
+fn load_obj(path: &Path) -> anyhow::Result<Scene> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let load_options = tobj::LoadOptions {
+        triangulate: true,
+        single_index: true,
+        ..Default::default()
+    };
+    let (models, materials) = tobj::load_obj(path, &load_options)
+        .with_context(|| format!("failed to load OBJ {}", path.display()))?;
+    let materials = materials.unwrap_or_default();
+    let textures = materials
+        .iter()
+        .map(|m| {
+            m.diffuse_texture
+                .as_deref()
+                .and_then(|name| load_texture(parent.join(name)).ok())
+                .map(Arc::new)
+        })
+        .collect::<Vec<_>>();
+
+    let mut scene = Scene::new();
+    for model in models {
+        let mesh = model.mesh;
+        let color = mesh
+            .material_id
+            .and_then(|id| materials.get(id))
+            .and_then(|m| m.diffuse)
+            .map(|c| to_rgba(c[0], c[1], c[2], 1.0))
+            .unwrap_or([196, 205, 214, 255]);
+        let texture = mesh
+            .material_id
+            .and_then(|id| textures.get(id))
+            .cloned()
+            .flatten();
+
+        for tri in mesh.indices.chunks_exact(3) {
+            let vertices = [
+                obj_vertex(&mesh, tri[0] as usize),
+                obj_vertex(&mesh, tri[1] as usize),
+                obj_vertex(&mesh, tri[2] as usize),
+            ];
+            scene.triangles.push(Triangle {
+                vertices: fix_normals(vertices),
+                color,
+                texture: texture.clone(),
+            });
+        }
+    }
+
+    Ok(scene)
+}
+
+fn load_gltf(path: &Path) -> anyhow::Result<Scene> {
+    let (document, buffers, images) =
+        gltf::import(path).with_context(|| format!("failed to load glTF {}", path.display()))?;
+
+    let textures = images
+        .into_iter()
+        .map(|image| gltf_image_to_texture(image).map(Arc::new))
+        .collect::<Vec<_>>();
+
+    let mut scene = Scene::new();
+    if let Some(default_scene) = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+    {
+        for node in default_scene.nodes() {
+            load_gltf_node(node, Mat4::IDENTITY, &buffers, &textures, &mut scene);
+        }
+    }
+
+    Ok(scene)
+}
+
+fn load_gltf_node(
+    node: gltf::Node<'_>,
+    parent_transform: Mat4,
+    buffers: &[gltf::buffer::Data],
+    textures: &[Option<Arc<Texture>>],
+    scene: &mut Scene,
+) {
+    let transform = parent_transform * gltf_transform(node.transform());
+
+    if let Some(mesh) = node.mesh() {
+        load_gltf_mesh(mesh, transform, buffers, textures, scene);
+    }
+
+    for child in node.children() {
+        load_gltf_node(child, transform, buffers, textures, scene);
+    }
+}
+
+fn load_gltf_mesh(
+    mesh: gltf::Mesh<'_>,
+    transform: Mat4,
+    buffers: &[gltf::buffer::Data],
+    textures: &[Option<Arc<Texture>>],
+    scene: &mut Scene,
+) {
+    let normal_transform = transform.inverse().transpose();
+
+    for primitive in mesh.primitives() {
+        let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+        let Some(positions) = reader.read_positions() else {
+            continue;
+        };
+        let positions = positions.map(Vec3::from).collect::<Vec<_>>();
+        let normals = reader
+            .read_normals()
+            .map(|n| n.map(Vec3::from).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let indices = reader
+            .read_indices()
+            .map(|i| i.into_u32().collect::<Vec<_>>())
+            .unwrap_or_else(|| (0..positions.len() as u32).collect());
+
+        let mat = primitive.material();
+        let pbr = mat.pbr_metallic_roughness();
+        let base = pbr.base_color_factor();
+        let color = to_rgba(base[0], base[1], base[2], base[3]);
+        let base_color_texture = pbr.base_color_texture();
+        let texcoord_set = base_color_texture
+            .as_ref()
+            .and_then(|info| {
+                info.texture_transform()
+                    .and_then(|transform| transform.tex_coord())
+            })
+            .or_else(|| base_color_texture.as_ref().map(|info| info.tex_coord()))
+            .unwrap_or(0);
+        let texture_transform = base_color_texture
+            .as_ref()
+            .and_then(|info| info.texture_transform())
+            .map(|transform| TextureTransformData {
+                offset: Vec2::from(transform.offset()),
+                scale: Vec2::from(transform.scale()),
+                rotation: transform.rotation(),
+            })
+            .unwrap_or_default();
+        let texcoords = reader
+            .read_tex_coords(texcoord_set)
+            .map(|t| {
+                t.into_f32()
+                    .map(Vec2::from)
+                    .map(|uv| texture_transform.apply(uv))
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                if texcoord_set != 0 {
+                    reader
+                        .read_tex_coords(0)
+                        .map(|t| t.into_f32().map(Vec2::from).collect::<Vec<_>>())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let texture = base_color_texture.as_ref().and_then(|info| {
+            textures
+                .get(info.texture().source().index())
+                .cloned()
+                .flatten()
+                .map(|texture| {
+                    let sampler = info.texture().sampler();
+                    Arc::new(
+                        (*texture)
+                            .clone()
+                            .with_wrap(wrap_mode(sampler.wrap_s()), wrap_mode(sampler.wrap_t())),
+                    )
+                })
+        });
+
+        for tri in indices.chunks_exact(3) {
+            let vertices = [
+                gltf_vertex(
+                    &positions,
+                    &normals,
+                    &texcoords,
+                    tri[0] as usize,
+                    transform,
+                    normal_transform,
+                ),
+                gltf_vertex(
+                    &positions,
+                    &normals,
+                    &texcoords,
+                    tri[1] as usize,
+                    transform,
+                    normal_transform,
+                ),
+                gltf_vertex(
+                    &positions,
+                    &normals,
+                    &texcoords,
+                    tri[2] as usize,
+                    transform,
+                    normal_transform,
+                ),
+            ];
+            scene.triangles.push(Triangle {
+                vertices: fix_normals(vertices),
+                color,
+                texture: texture.clone(),
+            });
+        }
+    }
+}
+
+fn load_fbx(path: &Path) -> anyhow::Result<Scene> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let path_utf8 = path
+        .to_str()
+        .ok_or_else(|| anyhow!("ufbx currently needs an UTF-8 path"))?;
+    let mut error = ufbx::Error::default();
+    let scene_ptr = unsafe {
+        ufbx::ufbx_load_file_len(
+            path_utf8.as_ptr(),
+            path_utf8.len(),
+            std::ptr::null(),
+            &mut error,
+        )
+    };
+    if scene_ptr.is_null() {
+        bail!("failed to load FBX: {:?}", error);
+    }
+
+    let scene_ref = unsafe { &*scene_ptr };
+    let mut scene = Scene::new();
+    for mesh in &scene_ref.meshes {
+        let materials = (&mesh.materials)
+            .into_iter()
+            .map(|material| fbx_material_data(material, parent))
+            .collect::<Vec<_>>();
+
+        for (face_index, face) in (&mesh.faces).into_iter().enumerate() {
+            let mut indices = Vec::new();
+            let count = ufbx::triangulate_face_vec(&mut indices, mesh, *face);
+            if count == 0 {
+                continue;
+            }
+            let material = mesh
+                .face_material
+                .get(face_index)
+                .and_then(|i| materials.get(*i as usize))
+                .cloned()
+                .unwrap_or_else(default_material_data);
+            for tri in indices.chunks_exact(3) {
+                let vertices = [
+                    fbx_vertex(mesh, tri[0] as usize),
+                    fbx_vertex(mesh, tri[1] as usize),
+                    fbx_vertex(mesh, tri[2] as usize),
+                ];
+                scene.triangles.push(Triangle {
+                    vertices: fix_normals(vertices),
+                    color: material.0,
+                    texture: material.1.clone(),
+                });
+            }
+        }
+    }
+
+    unsafe { ufbx::ufbx_free_scene(scene_ptr) };
+    Ok(scene)
+}
+
+fn load_texture(path: impl AsRef<Path>) -> anyhow::Result<Texture> {
+    Ok(Texture::from_image(image::open(path)?))
+}
+
+fn gltf_image_to_texture(image: gltf::image::Data) -> Option<Texture> {
+    let mut rgba = Vec::with_capacity((image.width * image.height * 4) as usize);
+
+    match image.format {
+        Format::R8 => {
+            for r in image.pixels {
+                rgba.extend_from_slice(&[r, r, r, 255]);
+            }
+        }
+        Format::R8G8 => {
+            for px in image.pixels.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        Format::R8G8B8 => {
+            for px in image.pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        Format::R8G8B8A8 => rgba = image.pixels,
+        Format::R16 => {
+            for px in image.pixels.chunks_exact(2) {
+                let r = px[1];
+                rgba.extend_from_slice(&[r, r, r, 255]);
+            }
+        }
+        Format::R16G16 => {
+            for px in image.pixels.chunks_exact(4) {
+                rgba.extend_from_slice(&[px[1], px[1], px[1], px[3]]);
+            }
+        }
+        Format::R16G16B16 => {
+            for px in image.pixels.chunks_exact(6) {
+                rgba.extend_from_slice(&[px[1], px[3], px[5], 255]);
+            }
+        }
+        Format::R16G16B16A16 => {
+            for px in image.pixels.chunks_exact(8) {
+                rgba.extend_from_slice(&[px[1], px[3], px[5], px[7]]);
+            }
+        }
+        Format::R32G32B32FLOAT | Format::R32G32B32A32FLOAT => return None,
+    }
+
+    Some(Texture::from_gltf_image(image.width, image.height, rgba))
+}
+
+fn wrap_mode(mode: WrappingMode) -> WrapMode {
+    match mode {
+        WrappingMode::ClampToEdge => WrapMode::ClampToEdge,
+        WrappingMode::MirroredRepeat => WrapMode::MirroredRepeat,
+        WrappingMode::Repeat => WrapMode::Repeat,
+    }
+}
+
+type MaterialData = ([u8; 4], Option<Arc<Texture>>);
+
+#[derive(Clone, Copy)]
+struct TextureTransformData {
+    offset: Vec2,
+    scale: Vec2,
+    rotation: f32,
+}
+
+impl Default for TextureTransformData {
+    fn default() -> Self {
+        Self {
+            offset: Vec2::ZERO,
+            scale: Vec2::ONE,
+            rotation: 0.0,
+        }
+    }
+}
+
+impl TextureTransformData {
+    fn apply(self, uv: Vec2) -> Vec2 {
+        let scaled = uv * self.scale;
+        let (sin, cos) = self.rotation.sin_cos();
+        Vec2::new(
+            scaled.x * cos - scaled.y * sin,
+            scaled.x * sin + scaled.y * cos,
+        ) + self.offset
+    }
+}
+
+fn default_material_data() -> MaterialData {
+    ([198, 202, 210, 255], None)
+}
+
+fn fbx_material_data(material: &ufbx::Material, parent: &Path) -> MaterialData {
+    let pbr = &material.pbr.base_color;
+    let fbx = &material.fbx.diffuse_color;
+    let color = if pbr.has_value {
+        vec4_to_rgba(pbr.value_vec4)
+    } else if fbx.has_value {
+        vec4_to_rgba(fbx.value_vec4)
+    } else {
+        default_material_data().0
+    };
+
+    let texture = pbr
+        .texture
+        .as_ref()
+        .or_else(|| fbx.texture.as_ref())
+        .and_then(|texture| load_fbx_texture(texture, parent).ok())
+        .map(Arc::new);
+
+    (color, texture)
+}
+
+fn load_fbx_texture(texture: &ufbx::Texture, parent: &Path) -> anyhow::Result<Texture> {
+    if texture.content.size > 0 {
+        return Ok(Texture::from_image(image::load_from_memory(
+            &texture.content,
+        )?));
+    }
+
+    for name in [
+        texture.absolute_filename.as_ref(),
+        texture.relative_filename.as_ref(),
+        texture.filename.as_ref(),
+    ] {
+        if name.is_empty() {
+            continue;
+        }
+        let path = Path::new(name);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            parent.join(path)
+        };
+        if let Ok(texture) = load_texture(&resolved) {
+            return Ok(texture);
+        }
+    }
+
+    bail!("FBX texture file not found");
+}
+
+fn obj_vertex(mesh: &tobj::Mesh, i: usize) -> Vertex {
+    Vertex {
+        position: read_vec3(&mesh.positions, i).unwrap_or(Vec3::ZERO),
+        normal: read_vec3(&mesh.normals, i).unwrap_or(Vec3::Z),
+        uv: read_vec2(&mesh.texcoords, i).unwrap_or(Vec2::ZERO),
+    }
+}
+
+fn gltf_vertex(
+    positions: &[Vec3],
+    normals: &[Vec3],
+    texcoords: &[Vec2],
+    i: usize,
+    transform: Mat4,
+    normal_transform: Mat4,
+) -> Vertex {
+    Vertex {
+        position: transform.transform_point3(positions.get(i).copied().unwrap_or(Vec3::ZERO)),
+        normal: normal_transform.transform_vector3(normals.get(i).copied().unwrap_or(Vec3::Z)),
+        uv: texcoords.get(i).copied().unwrap_or(Vec2::ZERO),
+    }
+}
+
+fn gltf_transform(transform: gltf::scene::Transform) -> Mat4 {
+    Mat4::from_cols_array_2d(&transform.matrix())
+}
+
+fn fbx_vertex(mesh: &ufbx::Mesh, i: usize) -> Vertex {
+    let p = mesh.vertex_position[i];
+    let n = if mesh.vertex_normal.exists {
+        mesh.vertex_normal[i]
+    } else {
+        ufbx::Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        }
+    };
+    let uv = if mesh.vertex_uv.exists {
+        mesh.vertex_uv[i]
+    } else {
+        ufbx::Vec2 { x: 0.0, y: 0.0 }
+    };
+    Vertex {
+        position: Vec3::new(p.x as f32, p.y as f32, p.z as f32),
+        normal: Vec3::new(n.x as f32, n.y as f32, n.z as f32),
+        uv: Vec2::new(uv.x as f32, uv.y as f32),
+    }
+}
+
+fn read_vec3(data: &[f32], index: usize) -> Option<Vec3> {
+    let i = index * 3;
+    Some(Vec3::new(
+        *data.get(i)?,
+        *data.get(i + 1)?,
+        *data.get(i + 2)?,
+    ))
+}
+
+fn read_vec2(data: &[f32], index: usize) -> Option<Vec2> {
+    let i = index * 2;
+    Some(Vec2::new(*data.get(i)?, *data.get(i + 1)?))
+}
+
+fn fix_normals(mut vertices: [Vertex; 3]) -> [Vertex; 3] {
+    let face = (vertices[1].position - vertices[0].position)
+        .cross(vertices[2].position - vertices[0].position)
+        .normalize_or_zero();
+    for vertex in &mut vertices {
+        if vertex.normal.length_squared() < 0.01 {
+            vertex.normal = face;
+        }
+    }
+    vertices
+}
+
+fn to_rgba(r: f32, g: f32, b: f32, a: f32) -> [u8; 4] {
+    [
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+        (a.clamp(0.0, 1.0) * 255.0) as u8,
+    ]
+}
+
+fn vec4_to_rgba(v: ufbx::Vec4) -> [u8; 4] {
+    to_rgba(v.x as f32, v.y as f32, v.z as f32, v.w as f32)
+}

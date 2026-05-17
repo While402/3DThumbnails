@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/renderer",
+    "crates/thumbgen",
+    "crates/thumbnail_provider",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "1.0.0"
+authors = ["3DThumbnails"]

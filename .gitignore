@@ -1,0 +1,8 @@
+/target/
+/target-msi/
+/.tools/
+/.reference/
+/*.msi
+/*.wixpdb
+/wix/obj/
+/wix/bin/
