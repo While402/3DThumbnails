@@ -117,9 +117,6 @@ The repository is organized as a Rust workspace:
 - `scripts`: registration, probing, cache-clearing, and packaging helpers.
 
 Generated folders such as `target`, `target-msi`, WiX object files, MSI files, and local tool downloads are ignored by Git.
-
-## SEO Keywords
-
 Windows Explorer 3D thumbnails, 3D model thumbnail provider, OBJ thumbnail viewer, FBX thumbnail preview, GLB thumbnail preview, glTF thumbnail preview, Windows 11 3D file thumbnails, Rust Windows Shell extension, 3D asset browser, game asset thumbnail generator.
 
 ## License
